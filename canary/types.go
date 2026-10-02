@@ -20,12 +20,18 @@ type Step struct {
 	TrafficPercent int
 	// InstancePercent 为该阶段金丝雀实例占全部实例的百分比 (0-100)。
 	InstancePercent int
+	// MinObservations 为进入该阶段后需要攒够的合格观察数据份数，
+	// 攒够后控制器自动推进到下一阶段；0 表示不做观察窗准入（兼容旧计划）。
+	MinObservations int
 }
 
 // Thresholds 描述健康准入与回滚的判定阈值。
 type Thresholds struct {
 	// MinSuccessRatio 为可接受的最低成功率 (0-1)。
 	MinSuccessRatio float64
+	// MinHealthyInstanceRatio 为可接受的最低健康实例覆盖率 (0-1)，
+	// 零值表示不考核实例覆盖维度（兼容旧计划）。
+	MinHealthyInstanceRatio float64
 	// BreachLimit 为触发自动回滚所需的连续不达标快照次数。
 	BreachLimit int
 }
@@ -46,16 +52,27 @@ type HealthSnapshot struct {
 	Seq uint64
 	// SuccessRatio 为该快照窗口内的请求成功率 (0-1)。
 	SuccessRatio float64
+	// HealthyInstanceRatio 为该快照窗口内健康实例占全部实例的比例 (0-1)。
+	HealthyInstanceRatio float64
+	// StepIndex 为该数据归属的阶段下标；只有归属当前阶段的数据才计入。
+	StepIndex int
+	// StepSeq 为阶段内顺序号，从 1 开始严格递增；0 表示旧版无归属数据，
+	// 仅参与健康判定（按全局 Seq 排序），不计入观察窗。
+	StepSeq uint64
 }
 
 // Status 为控制器对外暴露的发布状态。
 type Status struct {
-	State         State
-	CurrentStep   int  // 当前所处阶段下标，-1 表示尚未开始
-	BreachStreak  int  // 连续不达标快照计数
-	RolledBack    bool // 是否已回滚（单次发布至多一次）
-	LastSnapshot  uint64
-	AppliedRevision int64
+	State        State
+	CurrentStep  int  // 当前所处阶段下标，-1 表示尚未开始
+	BreachStreak int  // 连续不达标快照计数
+	RolledBack   bool // 是否已回滚（单次发布至多一次）
+	LastSnapshot uint64
+	// Observations 为当前阶段已攒够的合格观察数据份数。
+	Observations int
+	// RequiredObservations 为当前阶段观察窗要求的合格数据份数（0 表示无观察窗）。
+	RequiredObservations int
+	AppliedRevision      int64
 }
 
 // 可区分的拒绝原因。
@@ -70,4 +87,17 @@ var (
 	ErrStepOutOfRange = errors.New("canary: step index out of declared range")
 	ErrPaused         = errors.New("canary: rollout is paused due to unhealthy metrics")
 	ErrNoDesired      = errors.New("canary: no desired state submitted")
+
+	// ErrNoProgress 表示相邻两个阶段声明的流量与实例比例完全一致。
+	ErrNoProgress = errors.New("canary: adjacent steps must differ in traffic or instance percent")
+	// ErrInvalidThreshold 表示阈值取值越界。
+	ErrInvalidThreshold = errors.New("canary: ratio thresholds must be within [0,1]")
+	// ErrInvalidObservations 表示观察窗要求的份数为负。
+	ErrInvalidObservations = errors.New("canary: min observations must be >= 0")
+	// ErrStageMismatch 表示健康数据归属的阶段与当前阶段不一致，已被丢弃。
+	ErrStageMismatch = errors.New("canary: snapshot belongs to a different stage")
+	// ErrStepSeqStale 表示健康数据在阶段内乱序或重复，已被丢弃。
+	ErrStepSeqStale = errors.New("canary: snapshot is out of order within its stage")
+	// ErrInsufficientObservations 表示当前阶段观察窗未攒够合格数据，推进被挡下。
+	ErrInsufficientObservations = errors.New("canary: not enough qualified observations at current stage")
 )
