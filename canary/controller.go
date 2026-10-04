@@ -13,6 +13,15 @@ type Decision struct {
 	Reason string
 	// Snapshot 为参与判定的快照（若有），零值表示未消费快照。
 	Snapshot *HealthSnapshot
+	// Step 为本次判定所依据的阶段下标（数据归属的阶段）。
+	// 自动放量/末阶段完成时为刚刚攒满观察窗的那个阶段，而非进入的新阶段。
+	Step int
+	// Observations 为触发本次判定时该阶段已攒够的合格数据份数。
+	// 自动放量/末阶段完成记录的是“当次攒够”的份数（如 2/2 中的 2），
+	// 不是进入新阶段后被清零的值。
+	Observations int
+	// Required 为该阶段观察窗所需的合格数据份数；0 表示未启用观察窗。
+	Required int
 }
 
 // Controller 为金丝雀发布控制器，并发安全。
@@ -21,8 +30,9 @@ type Controller struct {
 	hasDesired bool
 	desired    DesiredState
 	status     Status
-	// hasStepSeq 标记当前阶段是否已消费过阶段内序号，
-	// 使每个阶段的第一份数据（StepSeq 可为 0）总能被接受。
+	// hasStepSeq 标记当前阶段是否已消费过携带阶段内序号的数据，
+	// 使每个阶段第一条显式带序号的数据（StepSeq 可为 0）总能被接受。
+	// 不带序号的旧格式数据不改变该标记。
 	hasStepSeq bool
 }
 
@@ -106,23 +116,34 @@ func (c *Controller) reconcileLocked(snap *HealthSnapshot) (Decision, error) {
 	}
 	c.status.LastSnapshot = snap.Seq
 	decision := Decision{Action: "ignored", Snapshot: snap}
+	// 所有消费到该快照的路径（含丢弃类）都带上真实的当前阶段与窗口进度，
+	// 便于审计；后续放量/回滚路径会在状态迁移前刷新为当次判定值。
+	decision.Step = c.status.CurrentStep
+	decision.Observations = c.status.Observations
+	decision.Required = c.desired.Steps[c.status.CurrentStep].MinObservations
 
-	// 阶段归属：只有属于当前阶段的数据才计入；来自其它阶段
-	// （包括已经走过的阶段）的数据直接丢弃，不触发回滚、不改变计数。
-	if snap.Step != c.status.CurrentStep {
+	// 阶段归属：显式携带阶段归属的数据，只有属于当前阶段才计入；来自其它
+	// 阶段（包括已经走过的阶段）的数据直接丢弃，不触发回滚、不改变计数。
+	// 未携带阶段归属的旧格式数据归入当前阶段，在任意阶段都可参与判定。
+	if snap.Step != nil && *snap.Step != c.status.CurrentStep {
 		decision.Reason = fmt.Sprintf("data belongs to step %d, current step is %d; dropped",
-			snap.Step, c.status.CurrentStep)
-		return decision, fmt.Errorf("%w: data step=%d current=%d", ErrWrongStep, snap.Step, c.status.CurrentStep)
+			*snap.Step, c.status.CurrentStep)
+		return decision, fmt.Errorf("%w: data step=%d current=%d", ErrWrongStep, *snap.Step, c.status.CurrentStep)
 	}
-	// 阶段内顺序：StepSeq 必须严格递增，重复投递或更早位置的数据丢弃。
-	if c.hasStepSeq && snap.StepSeq <= c.status.LastStepSeq {
-		decision.Reason = fmt.Sprintf("stale in-step seq=%d, last=%d at step %d; dropped",
-			snap.StepSeq, c.status.LastStepSeq, c.status.CurrentStep)
-		return decision, fmt.Errorf("%w: step=%d seq=%d last=%d",
-			ErrStaleStepSeq, snap.Step, snap.StepSeq, c.status.LastStepSeq)
+	// 阶段内顺序：仅对携带 StepSeq 的数据要求严格递增，重复投递或来自阶段内
+	// 更早位置的数据丢弃。未携带阶段内序号的旧格式数据跳过这层校验，
+	// 每条全局序号递增的数据都视为一份新数据；其重复投递仍由上方全局
+	// Seq 去重拦截，不会被重复计数。
+	if snap.StepSeq != nil {
+		if c.hasStepSeq && *snap.StepSeq <= c.status.LastStepSeq {
+			decision.Reason = fmt.Sprintf("stale in-step seq=%d, last=%d at step %d; dropped",
+				*snap.StepSeq, c.status.LastStepSeq, c.status.CurrentStep)
+			return decision, fmt.Errorf("%w: step=%d seq=%d last=%d",
+				ErrStaleStepSeq, c.status.CurrentStep, *snap.StepSeq, c.status.LastStepSeq)
+		}
+		c.hasStepSeq = true
+		c.status.LastStepSeq = *snap.StepSeq
 	}
-	c.hasStepSeq = true
-	c.status.LastStepSeq = snap.StepSeq
 
 	th := c.desired.Thresholds
 	successOK := snap.SuccessRatio >= th.MinSuccessRatio
@@ -142,15 +163,16 @@ func (c *Controller) reconcileLocked(snap *HealthSnapshot) (Decision, error) {
 		return c.maybeAutoAdvanceLocked(decision, snap, resumed)
 	case !c.status.RolledBack && c.status.BreachStreak+1 >= th.BreachLimit:
 		// 连续不达标累计到阈值：自动回滚。单次发布至多回滚一次。
+		breachAt := c.status.CurrentStep
 		c.status.BreachStreak++
 		c.status.RolledBack = true
 		c.status.State = StateRolledBack
 		c.status.CurrentStep = -1
 		decision.Action = "rollback"
-		decision.Reason = fmt.Sprintf("successRatio=%.4f(ok=%v) healthyRatio=%.4f(ok=%v) vs thresholds %.4f/%.4f; %d consecutive breaches >= limit %d",
+		decision.Reason = fmt.Sprintf("successRatio=%.4f(ok=%v) healthyRatio=%.4f(ok=%v) vs thresholds %.4f/%.4f; %d consecutive breaches at step %d >= limit %d",
 			snap.SuccessRatio, successOK, snap.HealthyRatio, coverageOK,
 			th.MinSuccessRatio, th.MinHealthyRatio,
-			c.status.BreachStreak, th.BreachLimit)
+			c.status.BreachStreak, breachAt, th.BreachLimit)
 	default:
 		// 未达回滚阈值：暂停推进，等待后续快照。
 		c.status.BreachStreak++
@@ -167,22 +189,26 @@ func (c *Controller) reconcileLocked(snap *HealthSnapshot) (Decision, error) {
 // maybeAutoAdvanceLocked 在计入一份合格数据后检查观察窗：
 // 攒够当前阶段所需份数则自动进入下一阶段（末阶段则完成发布）。
 func (c *Controller) maybeAutoAdvanceLocked(decision Decision, snap *HealthSnapshot, resumed bool) (Decision, error) {
-	step := c.desired.Steps[c.status.CurrentStep]
-	window := step.MinObservations
+	curStep := c.status.CurrentStep
+	window := c.desired.Steps[curStep].MinObservations
+	// 判定记录如实反映“当次计入后”的阶段与份数；下面进入新阶段会清零
+	// status.Observations，因此必须在 enterStepLocked 之前抓取。
+	decision.Step = curStep
+	decision.Observations = c.status.Observations
+	decision.Required = window
 	if window > 0 && c.status.Observations >= window {
-		if c.status.CurrentStep == len(c.desired.Steps)-1 {
+		if curStep == len(c.desired.Steps)-1 {
 			c.status.State = StateCompleted
 			decision.Action = "completed"
 			decision.Reason = fmt.Sprintf("observation window %d/%d filled at final step %d; rollout completed",
-				c.status.Observations, window, c.status.CurrentStep)
+				c.status.Observations, window, curStep)
 			return decision, nil
 		}
-		from := c.status.CurrentStep
-		c.enterStepLocked(from + 1)
+		c.enterStepLocked(curStep + 1)
 		next := c.desired.Steps[c.status.CurrentStep]
 		decision.Action = "auto-advanced"
 		decision.Reason = fmt.Sprintf("observation window %d/%d filled at step %d; auto-advanced to step %d: traffic=%d%% instances=%d%%",
-			c.status.Observations, window, from, from+1,
+			decision.Observations, window, curStep, curStep+1,
 			next.TrafficPercent, next.InstancePercent)
 		return decision, nil
 	}
@@ -192,7 +218,7 @@ func (c *Controller) maybeAutoAdvanceLocked(decision Decision, snap *HealthSnaps
 		decision.Action = "healthy"
 	}
 	decision.Reason = fmt.Sprintf("qualified data at step %d (observations %d%s); successRatio=%.4f healthyRatio=%.4f",
-		c.status.CurrentStep, c.status.Observations, windowSuffix(window),
+		curStep, c.status.Observations, windowSuffix(window),
 		snap.SuccessRatio, snap.HealthyRatio)
 	return decision, nil
 }
