@@ -48,11 +48,17 @@ type DesiredState struct {
 // HealthSnapshot 为一次实例健康快照，可能乱序到达。
 type HealthSnapshot struct {
 	// Seq 为全局单调递增的快照序号，用于识别并丢弃乱序旧快照。
+	// 该字段始终存在：即使采集端未上报阶段归属与阶段内序号，
+	// 重复/乱序数据仍可仅凭 Seq 被识别并丢弃。
 	Seq uint64
 	// Step 为该数据归属的发布阶段下标；只有属于当前阶段的数据才计入。
-	Step int
+	// 为 nil 时表示采集端未上报阶段归属（旧格式数据）：
+	// 数据按到达时刻归属当前阶段，不做跨阶段丢弃。
+	Step *int
 	// StepSeq 为阶段内单调递增的序号；同一阶段内重复或更早的数据被丢弃。
-	StepSeq uint64
+	// 为 nil 时表示采集端未上报阶段内序号（旧格式数据）：
+	// 该数据不参与阶段内顺序比较，仅按全局 Seq 保序与去重。
+	StepSeq *uint64
 	// SuccessRatio 为该快照窗口内的请求成功率 (0-1)。
 	SuccessRatio float64
 	// HealthyRatio 为该快照窗口内健康实例占全部实例的比例 (0-1)。

@@ -109,20 +109,26 @@ func (c *Controller) reconcileLocked(snap *HealthSnapshot) (Decision, error) {
 
 	// 阶段归属：只有属于当前阶段的数据才计入；来自其它阶段
 	// （包括已经走过的阶段）的数据直接丢弃，不触发回滚、不改变计数。
-	if snap.Step != c.status.CurrentStep {
+	// 未上报阶段归属的数据（旧采集端，Step == nil）按当前阶段计入。
+	if snap.Step != nil && *snap.Step != c.status.CurrentStep {
 		decision.Reason = fmt.Sprintf("data belongs to step %d, current step is %d; dropped",
-			snap.Step, c.status.CurrentStep)
-		return decision, fmt.Errorf("%w: data step=%d current=%d", ErrWrongStep, snap.Step, c.status.CurrentStep)
+			*snap.Step, c.status.CurrentStep)
+		return decision, fmt.Errorf("%w: data step=%d current=%d", ErrWrongStep, *snap.Step, c.status.CurrentStep)
 	}
-	// 阶段内顺序：StepSeq 必须严格递增，重复投递或更早位置的数据丢弃。
-	if c.hasStepSeq && snap.StepSeq <= c.status.LastStepSeq {
-		decision.Reason = fmt.Sprintf("stale in-step seq=%d, last=%d at step %d; dropped",
-			snap.StepSeq, c.status.LastStepSeq, c.status.CurrentStep)
-		return decision, fmt.Errorf("%w: step=%d seq=%d last=%d",
-			ErrStaleStepSeq, snap.Step, snap.StepSeq, c.status.LastStepSeq)
+	// 阶段内顺序：上报了 StepSeq 的数据必须在当前阶段内严格递增，
+	// 重复投递或更早位置的数据丢弃。
+	// 未上报阶段内序号的数据（旧采集端，StepSeq == nil）不参与该比较，
+	// 仅凭全局 Seq 保序/去重，因此不会把同阶段的后续数据误判为重复。
+	if snap.StepSeq != nil {
+		if c.hasStepSeq && *snap.StepSeq <= c.status.LastStepSeq {
+			decision.Reason = fmt.Sprintf("stale in-step seq=%d, last=%d at step %d; dropped",
+				*snap.StepSeq, c.status.LastStepSeq, c.status.CurrentStep)
+			return decision, fmt.Errorf("%w: step=%d seq=%d last=%d",
+				ErrStaleStepSeq, c.status.CurrentStep, *snap.StepSeq, c.status.LastStepSeq)
+		}
+		c.hasStepSeq = true
+		c.status.LastStepSeq = *snap.StepSeq
 	}
-	c.hasStepSeq = true
-	c.status.LastStepSeq = snap.StepSeq
 
 	th := c.desired.Thresholds
 	successOK := snap.SuccessRatio >= th.MinSuccessRatio
@@ -167,23 +173,28 @@ func (c *Controller) reconcileLocked(snap *HealthSnapshot) (Decision, error) {
 // maybeAutoAdvanceLocked 在计入一份合格数据后检查观察窗：
 // 攒够当前阶段所需份数则自动进入下一阶段（末阶段则完成发布）。
 func (c *Controller) maybeAutoAdvanceLocked(decision Decision, snap *HealthSnapshot, resumed bool) (Decision, error) {
-	step := c.desired.Steps[c.status.CurrentStep]
+	cur := c.status.CurrentStep
+	filled := c.status.Observations // 本阶段当次攒够后的份数（进入新阶段前捕获）
+	step := c.desired.Steps[cur]
 	window := step.MinObservations
-	if window > 0 && c.status.Observations >= window {
-		if c.status.CurrentStep == len(c.desired.Steps)-1 {
+	if window > 0 && filled >= window {
+		if cur == len(c.desired.Steps)-1 {
 			c.status.State = StateCompleted
 			decision.Action = "completed"
-			decision.Reason = fmt.Sprintf("observation window %d/%d filled at final step %d; rollout completed",
-				c.status.Observations, window, c.status.CurrentStep)
+			decision.Reason = fmt.Sprintf("observation window %d/%d filled at final step %d; rollout completed; qualified by successRatio=%.4f>=%.4f healthyRatio=%.4f>=%.4f",
+				filled, window, cur,
+				snap.SuccessRatio, c.desired.Thresholds.MinSuccessRatio,
+				snap.HealthyRatio, c.desired.Thresholds.MinHealthyRatio)
 			return decision, nil
 		}
-		from := c.status.CurrentStep
-		c.enterStepLocked(from + 1)
-		next := c.desired.Steps[c.status.CurrentStep]
+		c.enterStepLocked(cur + 1)
+		next := c.desired.Steps[cur+1]
 		decision.Action = "auto-advanced"
-		decision.Reason = fmt.Sprintf("observation window %d/%d filled at step %d; auto-advanced to step %d: traffic=%d%% instances=%d%%",
-			c.status.Observations, window, from, from+1,
-			next.TrafficPercent, next.InstancePercent)
+		decision.Reason = fmt.Sprintf("observation window %d/%d filled at step %d; auto-advanced to step %d: traffic=%d%% instances=%d%%; qualified by successRatio=%.4f>=%.4f healthyRatio=%.4f>=%.4f",
+			filled, window, cur, cur+1,
+			next.TrafficPercent, next.InstancePercent,
+			snap.SuccessRatio, c.desired.Thresholds.MinSuccessRatio,
+			snap.HealthyRatio, c.desired.Thresholds.MinHealthyRatio)
 		return decision, nil
 	}
 	if resumed {
@@ -192,7 +203,7 @@ func (c *Controller) maybeAutoAdvanceLocked(decision Decision, snap *HealthSnaps
 		decision.Action = "healthy"
 	}
 	decision.Reason = fmt.Sprintf("qualified data at step %d (observations %d%s); successRatio=%.4f healthyRatio=%.4f",
-		c.status.CurrentStep, c.status.Observations, windowSuffix(window),
+		cur, filled, windowSuffix(window),
 		snap.SuccessRatio, snap.HealthyRatio)
 	return decision, nil
 }

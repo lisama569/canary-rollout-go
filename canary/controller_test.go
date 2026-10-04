@@ -2,18 +2,40 @@ package canary
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
+
+// intp / uintp 将阶段下标与阶段内序号包装为指针，
+// 表示采集端显式上报了对应字段（新格式数据）。
+func intp(i int) *int        { return &i }
+func uintp(u uint64) *uint64 { return &u }
+
+// optInt / optUint 在日志中渲染可选字段：未上报显示 "-"（旧格式数据）。
+func optInt(p *int) string {
+	if p == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", *p)
+}
+
+func optUint(p *uint64) string {
+	if p == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", *p)
+}
 
 // logDecision 在单测日志中打印阶段、健康输入与判定依据。
 func logDecision(t *testing.T, c *Controller, d Decision, err error, label string) {
 	t.Helper()
 	s := c.Status()
 	if d.Snapshot != nil {
-		t.Logf("[%s] state=%s step=%d obs=%d | health seq=%d step=%d stepSeq=%d successRatio=%.4f healthyRatio=%.4f | action=%s reason=%q err=%v",
-			label, s.State, s.CurrentStep, s.Observations,
-			d.Snapshot.Seq, d.Snapshot.Step, d.Snapshot.StepSeq,
+		t.Logf("[%s] state=%s step=%d obs=%d streak=%d | health seq=%d step=%s stepSeq=%s successRatio=%.4f healthyRatio=%.4f | action=%s reason=%q err=%v",
+			label, s.State, s.CurrentStep, s.Observations, s.BreachStreak,
+			d.Snapshot.Seq, optInt(d.Snapshot.Step), optUint(d.Snapshot.StepSeq),
 			d.Snapshot.SuccessRatio, d.Snapshot.HealthyRatio,
 			d.Action, d.Reason, err)
 	} else {
@@ -49,11 +71,22 @@ func windowedDesired() DesiredState {
 	}
 }
 
-// qualifiedSnap 构造一份两个维度都达标的健康数据。
+// qualifiedSnap 构造一份两个维度都达标、且显式带上阶段归属与阶段内序号的
+// 健康数据（新格式）。
 func qualifiedSnap(seq uint64, step int, stepSeq uint64) *HealthSnapshot {
 	return &HealthSnapshot{
-		Seq: seq, Step: step, StepSeq: stepSeq,
+		Seq: seq, Step: intp(step), StepSeq: uintp(stepSeq),
 		SuccessRatio: 0.99, HealthyRatio: 0.99,
+	}
+}
+
+// legacySnap 构造旧采集端格式的健康数据：只上报全局序号与两个健康维度，
+// 不带阶段归属（Step）与阶段内序号（StepSeq）。
+func legacySnap(seq uint64, successRatio, healthyRatio float64) *HealthSnapshot {
+	return &HealthSnapshot{
+		Seq:          seq,
+		SuccessRatio: successRatio,
+		HealthyRatio: healthyRatio,
 	}
 }
 
@@ -154,7 +187,7 @@ func TestThresholdJitter(t *testing.T) {
 	// 交替抖动不得累计到回滚阈值，也不得引发状态回退。
 	ratios := []float64{0.94, 0.96, 0.93, 0.97, 0.94, 0.95, 0.94, 0.99}
 	for i, r := range ratios {
-		d, err := c.Reconcile(&HealthSnapshot{Seq: uint64(i + 1), Step: 0, StepSeq: uint64(i + 1), SuccessRatio: r})
+		d, err := c.Reconcile(&HealthSnapshot{Seq: uint64(i + 1), Step: intp(0), StepSeq: uintp(uint64(i + 1)), SuccessRatio: r})
 		logDecision(t, c, d, err, "jitter")
 		if err != nil {
 			t.Fatalf("reconcile seq=%d: %v", i+1, err)
@@ -181,7 +214,7 @@ func TestAutoRollbackAtMostOnce(t *testing.T) {
 	// 连续 3 次不达标（达到 BreachLimit）触发恰好一次自动回滚。
 	rollbacks := 0
 	for seq := uint64(1); seq <= 3; seq++ {
-		d, err := c.Reconcile(&HealthSnapshot{Seq: seq, Step: 0, StepSeq: seq, SuccessRatio: 0.80})
+		d, err := c.Reconcile(&HealthSnapshot{Seq: seq, Step: intp(0), StepSeq: uintp(seq), SuccessRatio: 0.80})
 		logDecision(t, c, d, err, "breach")
 		if err != nil {
 			t.Fatalf("reconcile seq=%d: %v", seq, err)
@@ -198,7 +231,7 @@ func TestAutoRollbackAtMostOnce(t *testing.T) {
 	}
 
 	// 回滚后更多坏快照不得引发第二次回滚，终结态不得被重新激活。
-	d, err := c.Reconcile(&HealthSnapshot{Seq: 4, Step: 0, StepSeq: 4, SuccessRatio: 0.10})
+	d, err := c.Reconcile(&HealthSnapshot{Seq: 4, Step: intp(0), StepSeq: uintp(4), SuccessRatio: 0.10})
 	logDecision(t, c, d, err, "post-rollback snapshot")
 	if !errors.Is(err, ErrTerminal) {
 		t.Fatalf("reconcile after rollback error = %v, want ErrTerminal", err)
@@ -222,13 +255,13 @@ func TestOutOfOrderSnapshots(t *testing.T) {
 
 	// 先消费 seq=1（坏），随后乱序到达的旧快照必须被丢弃，
 	// 不得重复计入违约，也不得清零已有计数。
-	d, err := c.Reconcile(&HealthSnapshot{Seq: 1, Step: 0, StepSeq: 1, SuccessRatio: 0.80})
+	d, err := c.Reconcile(&HealthSnapshot{Seq: 1, Step: intp(0), StepSeq: uintp(1), SuccessRatio: 0.80})
 	logDecision(t, c, d, err, "seq=1 bad")
 	if err != nil || c.Status().BreachStreak != 1 {
 		t.Fatalf("seq=1: streak=%d err=%v", c.Status().BreachStreak, err)
 	}
 	for _, seq := range []uint64{1, 1, 0} {
-		d, err = c.Reconcile(&HealthSnapshot{Seq: seq, Step: 0, StepSeq: seq, SuccessRatio: 0.99})
+		d, err = c.Reconcile(&HealthSnapshot{Seq: seq, Step: intp(0), StepSeq: uintp(seq), SuccessRatio: 0.99})
 		logDecision(t, c, d, err, "stale")
 		if !errors.Is(err, ErrStaleSnapshot) {
 			t.Fatalf("stale seq=%d error = %v, want ErrStaleSnapshot", seq, err)
@@ -238,9 +271,9 @@ func TestOutOfOrderSnapshots(t *testing.T) {
 		}
 	}
 	// 更新的乱序坏快照继续累计，达到阈值后回滚恰好一次。
-	d, err = c.Reconcile(&HealthSnapshot{Seq: 2, Step: 0, StepSeq: 2, SuccessRatio: 0.80})
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 2, Step: intp(0), StepSeq: uintp(2), SuccessRatio: 0.80})
 	logDecision(t, c, d, err, "seq=2 bad")
-	d, err = c.Reconcile(&HealthSnapshot{Seq: 3, Step: 0, StepSeq: 3, SuccessRatio: 0.80})
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 3, Step: intp(0), StepSeq: uintp(3), SuccessRatio: 0.80})
 	logDecision(t, c, d, err, "seq=3 bad")
 	if d.Action != "rollback" {
 		t.Fatalf("seq=3 action = %s, want rollback", d.Action)
@@ -256,7 +289,7 @@ func TestPausedAdvanceRejected(t *testing.T) {
 		t.Fatalf("Advance(0): %v", err)
 	}
 	// 一次不达标使发布暂停，暂停期间推进必须被拒绝。
-	d, err := c.Reconcile(&HealthSnapshot{Seq: 1, Step: 0, StepSeq: 1, SuccessRatio: 0.80})
+	d, err := c.Reconcile(&HealthSnapshot{Seq: 1, Step: intp(0), StepSeq: uintp(1), SuccessRatio: 0.80})
 	logDecision(t, c, d, err, "pause")
 	d, err = c.Advance(1)
 	logDecision(t, c, d, err, "advance while paused")
@@ -264,7 +297,7 @@ func TestPausedAdvanceRejected(t *testing.T) {
 		t.Fatalf("advance while paused error = %v, want ErrPaused", err)
 	}
 	// 健康快照恢复推进后，推进被允许。
-	d, err = c.Reconcile(&HealthSnapshot{Seq: 2, Step: 0, StepSeq: 2, SuccessRatio: 0.99})
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 2, Step: intp(0), StepSeq: uintp(2), SuccessRatio: 0.99})
 	logDecision(t, c, d, err, "resume")
 	d, err = c.Advance(1)
 	logDecision(t, c, d, err, "advance after resume")
@@ -294,10 +327,10 @@ func TestConcurrentReconcile(t *testing.T) {
 				var err error
 				if w%2 == 0 {
 					// 重放同一快照，应被幂等丢弃。
-					d, err = c.Reconcile(&HealthSnapshot{Seq: 1, Step: 0, StepSeq: 1, SuccessRatio: 0.99})
+					d, err = c.Reconcile(&HealthSnapshot{Seq: 1, Step: intp(0), StepSeq: uintp(1), SuccessRatio: 0.99})
 				} else {
 					// 递增序号的坏快照，最终应触发恰好一次回滚。
-					d, err = c.Reconcile(&HealthSnapshot{Seq: uint64(i + 2), Step: 0, StepSeq: uint64(i + 2), SuccessRatio: 0.50})
+					d, err = c.Reconcile(&HealthSnapshot{Seq: uint64(i + 2), Step: intp(0), StepSeq: uintp(uint64(i + 2)), SuccessRatio: 0.50})
 				}
 				if err != nil && !errors.Is(err, ErrStaleSnapshot) && !errors.Is(err, ErrTerminal) {
 					t.Errorf("worker %d iter %d: unexpected error %v (action=%s)", w, i, err, d.Action)
@@ -449,7 +482,7 @@ func TestAdvanceBlockedReasons(t *testing.T) {
 	}
 
 	// 一份不达标数据使发布暂停：推进被挡，原因是健康不达标（可与数据不够区分）。
-	d, err = c.Reconcile(&HealthSnapshot{Seq: 1, Step: 0, StepSeq: 1, SuccessRatio: 0.50, HealthyRatio: 0.99})
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 1, Step: intp(0), StepSeq: uintp(1), SuccessRatio: 0.50, HealthyRatio: 0.99})
 	logDecision(t, c, d, err, "breach -> paused")
 	d, err = c.Advance(1)
 	logDecision(t, c, d, err, "advance while paused")
@@ -508,7 +541,7 @@ func TestCrossStepAndOutOfOrderDataDropped(t *testing.T) {
 
 	// 阶段内重复与更早位置的数据：丢弃，不计数。
 	for i, ss := range []uint64{5, 5, 3} {
-		d, err = c.Reconcile(&HealthSnapshot{Seq: uint64(3 + i), Step: 0, StepSeq: ss, SuccessRatio: 0.99, HealthyRatio: 0.99})
+		d, err = c.Reconcile(&HealthSnapshot{Seq: uint64(3 + i), Step: intp(0), StepSeq: uintp(ss), SuccessRatio: 0.99, HealthyRatio: 0.99})
 		logDecision(t, c, d, err, "stale in-step")
 		if !errors.Is(err, ErrStaleStepSeq) {
 			t.Fatalf("stale stepSeq=%d error = %v, want ErrStaleStepSeq", ss, err)
@@ -526,7 +559,7 @@ func TestCrossStepAndOutOfOrderDataDropped(t *testing.T) {
 	}
 
 	// 已走过阶段的数据（即使不健康）：丢弃，不触发回滚、不让阶段倒退。
-	d, err = c.Reconcile(&HealthSnapshot{Seq: 11, Step: 0, StepSeq: 7, SuccessRatio: 0.10, HealthyRatio: 0.10})
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 11, Step: intp(0), StepSeq: uintp(7), SuccessRatio: 0.10, HealthyRatio: 0.10})
 	logDecision(t, c, d, err, "old step bad data")
 	if !errors.Is(err, ErrWrongStep) {
 		t.Fatalf("old step data error = %v, want ErrWrongStep", err)
@@ -547,7 +580,7 @@ func TestUnhealthyCoverageBlocksWindow(t *testing.T) {
 	}
 
 	// 成功率达标但实例健康覆盖不达标：不算合格数据，不计入观察窗，且累计违约。
-	d, err := c.Reconcile(&HealthSnapshot{Seq: 1, Step: 0, StepSeq: 1, SuccessRatio: 0.99, HealthyRatio: 0.50})
+	d, err := c.Reconcile(&HealthSnapshot{Seq: 1, Step: intp(0), StepSeq: uintp(1), SuccessRatio: 0.99, HealthyRatio: 0.50})
 	logDecision(t, c, d, err, "coverage breach")
 	if err != nil || d.Action != "paused" {
 		t.Fatalf("coverage breach: action=%s err=%v", d.Action, err)
@@ -557,7 +590,7 @@ func TestUnhealthyCoverageBlocksWindow(t *testing.T) {
 	}
 
 	// 覆盖率达标但成功率不达标：同样不算合格数据。
-	d, err = c.Reconcile(&HealthSnapshot{Seq: 2, Step: 0, StepSeq: 2, SuccessRatio: 0.50, HealthyRatio: 0.99})
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 2, Step: intp(0), StepSeq: uintp(2), SuccessRatio: 0.50, HealthyRatio: 0.99})
 	logDecision(t, c, d, err, "success breach")
 	if s := c.Status(); s.Observations != 0 || s.BreachStreak != 2 {
 		t.Fatalf("success breach: obs=%d streak=%d, want obs=0 streak=2", s.Observations, s.BreachStreak)
@@ -658,5 +691,357 @@ func TestLongRunNoCountDrift(t *testing.T) {
 	}
 	if s.LastStepSeq != unique {
 		t.Fatalf("lastStepSeq = %d, want %d", s.LastStepSeq, unique)
+	}
+}
+
+// TestLegacySnapshotsAutoRollback 覆盖旧采集端格式（只上报全局序号与两个
+// 健康维度，不带 Step/StepSeq）：连续不达标必须照旧累计并触发自动回滚。
+// 关键点：进入阶段 1 后旧格式数据仍被计入（不会只有每阶段第一条被采用），
+// 因此跨阶段的连续不达标也能攒满 BreachLimit。
+func TestLegacySnapshotsAutoRollback(t *testing.T) {
+	t.Run("连续不达标在阶段0攒满即回滚", func(t *testing.T) {
+		c := New()
+		if err := c.Submit(windowedDesired()); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		if _, err := c.Advance(0); err != nil {
+			t.Fatalf("Advance(0): %v", err)
+		}
+		rollbacks := 0
+		// 3 份连续不健康的旧格式数据，成功率/覆盖率均不达标。
+		for seq := uint64(1); seq <= 3; seq++ {
+			d, err := c.Reconcile(legacySnap(seq, 0.50, 0.50))
+			logDecision(t, c, d, err, "legacy breach")
+			if err != nil {
+				t.Fatalf("legacy snap seq=%d: %v", seq, err)
+			}
+			if d.Action == "rollback" {
+				rollbacks++
+			}
+		}
+		if rollbacks != 1 {
+			t.Fatalf("legacy rollback count = %d, want 1", rollbacks)
+		}
+		if s := c.Status(); s.State != StateRolledBack || !s.RolledBack {
+			t.Fatalf("state=%s rolledBack=%v, want RolledBack", s.State, s.RolledBack)
+		}
+		// 回滚为终结态：旧格式数据同样不能重新激活。
+		d, err := c.Reconcile(legacySnap(4, 0.99, 0.99))
+		logDecision(t, c, d, err, "legacy after rollback")
+		if !errors.Is(err, ErrTerminal) {
+			t.Fatalf("reconcile after rollback error=%v, want ErrTerminal", err)
+		}
+	})
+
+	t.Run("跨阶段旧格式坏数据继续累计并回滚", func(t *testing.T) {
+		c := New()
+		// 阶段 0 不启用观察窗，可直接人工推进到阶段 1。
+		desired := standardDesired()
+		if err := c.Submit(desired); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		if _, err := c.Advance(0); err != nil {
+			t.Fatalf("Advance(0): %v", err)
+		}
+		// 阶段 0：2 份旧格式坏数据（BreachLimit=3）。
+		for seq := uint64(1); seq <= 2; seq++ {
+			d, err := c.Reconcile(legacySnap(seq, 0.50, 0.50))
+			logDecision(t, c, d, err, "legacy breach step0")
+			if err != nil || c.Status().BreachStreak != int(seq) {
+				t.Fatalf("step0 seq=%d: streak=%d err=%v", seq, c.Status().BreachStreak, err)
+			}
+		}
+		// 暂停期间人工推进被拒；用一份旧格式合格数据恢复后推进到阶段 1。
+		d, err := c.Reconcile(legacySnap(3, 0.99, 0.99))
+		logDecision(t, c, d, err, "legacy resume")
+		if d.Action != "resumed" {
+			t.Fatalf("resume action=%s, want resumed", d.Action)
+		}
+		if _, err := c.Advance(1); err != nil {
+			t.Fatalf("Advance(1): %v", err)
+		}
+		if s := c.Status(); s.CurrentStep != 1 || s.BreachStreak != 0 {
+			t.Fatalf("after advance: step=%d streak=%d", s.CurrentStep, s.BreachStreak)
+		}
+		// 阶段 1：旧格式数据必须继续被计入（这正是旧版本卡死的场景），
+		// 3 份坏数据攒满 BreachLimit，恰好触发一次回滚。
+		rollbacks := 0
+		for seq := uint64(4); seq <= 6; seq++ {
+			d, err = c.Reconcile(legacySnap(seq, 0.50, 0.50))
+			logDecision(t, c, d, err, "legacy breach step1")
+			if err != nil {
+				t.Fatalf("step1 legacy snap seq=%d: %v", seq, err)
+			}
+			if d.Action == "rollback" {
+				rollbacks++
+			}
+		}
+		if rollbacks != 1 {
+			t.Fatalf("step1 legacy rollback count=%d, want 1", rollbacks)
+		}
+		if c.Status().State != StateRolledBack {
+			t.Fatalf("state=%s, want RolledBack", c.Status().State)
+		}
+	})
+}
+
+// TestLegacySnapshotsFillWindowAndAutoAdvance 覆盖旧采集端格式的合格数据：
+// 不带 Step/StepSeq 时，数据按到达时刻归属当前阶段并计入观察窗，
+// 攒满后自动放量；末阶段攒满后自动完成。
+// 旧版本中这类数据在阶段内只有第一条被采用，观察窗永远填不满。
+func TestLegacySnapshotsFillWindowAndAutoAdvance(t *testing.T) {
+	c := New()
+	if err := c.Submit(windowedDesired()); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := c.Advance(0); err != nil {
+		t.Fatalf("Advance(0): %v", err)
+	}
+
+	// 阶段 0：第 1 份旧格式合格数据，obs=1/2，停留原地。
+	d, err := c.Reconcile(legacySnap(1, 0.99, 0.99))
+	logDecision(t, c, d, err, "legacy obs 1/2")
+	if err != nil || d.Action != "healthy" {
+		t.Fatalf("legacy obs 1/2: action=%s err=%v", d.Action, err)
+	}
+	if s := c.Status(); s.CurrentStep != 0 || s.Observations != 1 {
+		t.Fatalf("legacy obs 1/2: step=%d obs=%d", s.CurrentStep, s.Observations)
+	}
+
+	// 第 2 份：攒满 2/2，自动进入阶段 1。
+	d, err = c.Reconcile(legacySnap(2, 0.99, 0.99))
+	logDecision(t, c, d, err, "legacy obs 2/2 -> auto")
+	if err != nil || d.Action != "auto-advanced" {
+		t.Fatalf("legacy window filled: action=%s err=%v", d.Action, err)
+	}
+	if s := c.Status(); s.CurrentStep != 1 || s.Observations != 0 {
+		t.Fatalf("after legacy auto-advance: step=%d obs=%d", s.CurrentStep, s.Observations)
+	}
+
+	// 阶段 1 同样攒满 2 份旧格式数据，自动进入末阶段。
+	for seq := uint64(3); seq <= 4; seq++ {
+		d, err = c.Reconcile(legacySnap(seq, 0.99, 0.99))
+		logDecision(t, c, d, err, "legacy step1 obs")
+	}
+	if d.Action != "auto-advanced" || c.Status().CurrentStep != 2 {
+		t.Fatalf("legacy step1 window: action=%s step=%d", d.Action, c.Status().CurrentStep)
+	}
+
+	// 末阶段攒满 2 份后自动完成。
+	for seq := uint64(5); seq <= 6; seq++ {
+		d, err = c.Reconcile(legacySnap(seq, 0.99, 0.99))
+		logDecision(t, c, d, err, "legacy final obs")
+	}
+	if d.Action != "completed" || c.Status().State != StateCompleted {
+		t.Fatalf("legacy final window: action=%s state=%s", d.Action, c.Status().State)
+	}
+
+	// 终结态：旧格式数据也不能重新激活。
+	d, err = c.Reconcile(legacySnap(7, 0.99, 0.99))
+	logDecision(t, c, d, err, "legacy after complete")
+	if !errors.Is(err, ErrTerminal) {
+		t.Fatalf("reconcile after complete error=%v, want ErrTerminal", err)
+	}
+}
+
+// TestAutoAdvanceDecisionRecordsFilledWindow 校验自动放量与末阶段完成时的
+// 判定记录：必须如实反映当次攒够的份数（N/N，而非清零后的 0/N）、
+// 所处阶段以及判定依据（两个维度的阈值比较）。
+func TestAutoAdvanceDecisionRecordsFilledWindow(t *testing.T) {
+	c := New()
+	if err := c.Submit(windowedDesired()); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := c.Advance(0); err != nil {
+		t.Fatalf("Advance(0): %v", err)
+	}
+
+	// 攒满阶段 0 的 2/2：记录份数为 2/2、阶段为 0，并给出放量目标与判定依据。
+	var d Decision
+	for seq := uint64(1); seq <= 2; seq++ {
+		var err error
+		d, err = c.Reconcile(qualifiedSnap(seq, 0, seq))
+		logDecision(t, c, d, err, "step0 fill")
+		if err != nil {
+			t.Fatalf("step0 seq=%d: %v", seq, err)
+		}
+	}
+	if d.Action != "auto-advanced" {
+		t.Fatalf("action=%s, want auto-advanced", d.Action)
+	}
+	wantContains := []string{
+		"observation window 2/2 filled at step 0",
+		"auto-advanced to step 1",
+		"traffic=30% instances=30%",
+		"successRatio=0.9900>=0.9500",
+		"healthyRatio=0.9900>=0.9000",
+	}
+	for _, want := range wantContains {
+		if !strings.Contains(d.Reason, want) {
+			t.Fatalf("auto-advance reason %q missing %q", d.Reason, want)
+		}
+	}
+	// 动作发生后状态已在阶段 1 且窗口清零——记录里的份数不随清零而变。
+	if s := c.Status(); s.CurrentStep != 1 || s.Observations != 0 {
+		t.Fatalf("state after fill: step=%d obs=%d", s.CurrentStep, s.Observations)
+	}
+
+	// 阶段 1 攒满后同样核对 2/2 与阶段 1。
+	for i := uint64(1); i <= 2; i++ {
+		var err error
+		d, err = c.Reconcile(qualifiedSnap(2+i, 1, i))
+		logDecision(t, c, d, err, "step1 fill")
+		if err != nil {
+			t.Fatalf("step1 i=%d: %v", i, err)
+		}
+	}
+	if d.Action != "auto-advanced" {
+		t.Fatalf("action=%s, want auto-advanced", d.Action)
+	}
+	if !strings.Contains(d.Reason, "observation window 2/2 filled at step 1") ||
+		!strings.Contains(d.Reason, "auto-advanced to step 2") {
+		t.Fatalf("step1 reason = %q, want 2/2 at step 1 -> step 2", d.Reason)
+	}
+
+	// 末阶段完成：记录 2/2、final step 2 与判定依据，且不得显示 0/2。
+	for i := uint64(1); i <= 2; i++ {
+		var err error
+		d, err = c.Reconcile(qualifiedSnap(4+i, 2, i))
+		logDecision(t, c, d, err, "step2 fill")
+		if err != nil {
+			t.Fatalf("step2 i=%d: %v", i, err)
+		}
+	}
+	if d.Action != "completed" || c.Status().State != StateCompleted {
+		t.Fatalf("action=%s state=%s, want completed/Completed", d.Action, c.Status().State)
+	}
+	for _, want := range []string{
+		"observation window 2/2 filled at final step 2",
+		"rollout completed",
+		"successRatio=0.9900>=0.9500",
+		"healthyRatio=0.9900>=0.9000",
+	} {
+		if !strings.Contains(d.Reason, want) {
+			t.Fatalf("completed reason %q missing %q", d.Reason, want)
+		}
+	}
+	if strings.Contains(d.Reason, "0/2") {
+		t.Fatalf("completed reason must not report reset count: %q", d.Reason)
+	}
+}
+
+// TestLegacyConcurrentDuplicateDelivery 覆盖旧采集端数据的并发重复投递：
+// 数据没有 Step/StepSeq，只能凭全局 Seq 去重。8 个协程并发投递同一批
+// 旧格式数据，每份唯一数据必须恰好计入一次，观察窗进度不得翻倍。
+func TestLegacyConcurrentDuplicateDelivery(t *testing.T) {
+	desired := windowedDesired()
+	desired.Steps[0].MinObservations = 100 // 窗口大于唯一份数，期间不放量
+	c := New()
+	if err := c.Submit(desired); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := c.Advance(0); err != nil {
+		t.Fatalf("Advance(0): %v", err)
+	}
+
+	const workers, batch = 8, 60
+	var accepted int64
+	var mu sync.Mutex
+	done := make(chan struct{}, workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := 1; i <= batch; i++ {
+				// 每轮都新建快照，模拟多个协程独立重放同一批旧格式数据。
+				d, err := c.Reconcile(legacySnap(uint64(i), 0.99, 0.99))
+				if err == nil {
+					mu.Lock()
+					accepted++
+					mu.Unlock()
+				} else if !errors.Is(err, ErrStaleSnapshot) {
+					t.Errorf("legacy delivery: unexpected error %v (action=%s)", err, d.Action)
+				}
+			}
+		}()
+	}
+	for w := 0; w < workers; w++ {
+		<-done
+	}
+
+	s := c.Status()
+	t.Logf("[legacy-dup] accepted=%d step=%d obs=%d lastSnapshot=%d",
+		accepted, s.CurrentStep, s.Observations, s.LastSnapshot)
+	if accepted != batch {
+		t.Fatalf("accepted=%d, want exactly %d (no double counting)", accepted, batch)
+	}
+	if s.Observations != batch || s.CurrentStep != 0 {
+		t.Fatalf("obs=%d step=%d, want obs=%d step=0", s.Observations, s.CurrentStep, batch)
+	}
+	if s.LastSnapshot != batch {
+		t.Fatalf("lastSnapshot=%d, want %d", s.LastSnapshot, batch)
+	}
+}
+
+// TestMixedLegacyAndNewFormatDedup 验证新旧格式数据混合投递时：
+// 旧格式（无 Step/StepSeq）按当前阶段计入，仅按全局 Seq 去重；
+// 新格式的跨阶段与阶段内乱序/重复数据仍被丢弃；二者互不污染计数。
+func TestMixedLegacyAndNewFormatDedup(t *testing.T) {
+	c := New()
+	if err := c.Submit(windowedDesired()); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := c.Advance(0); err != nil {
+		t.Fatalf("Advance(0): %v", err)
+	}
+
+	// 新格式：阶段 0 第 1 份合格数据，obs=1。
+	d, err := c.Reconcile(qualifiedSnap(1, 0, 1))
+	logDecision(t, c, d, err, "new obs 1")
+	if err != nil || c.Status().Observations != 1 {
+		t.Fatalf("new obs 1: obs=%d err=%v", c.Status().Observations, err)
+	}
+
+	// 旧格式：归属当前阶段 0，计入，obs=2；此时窗口 2/2 攒满，自动放量。
+	d, err = c.Reconcile(legacySnap(2, 0.99, 0.99))
+	logDecision(t, c, d, err, "legacy obs 2 -> auto")
+	if d.Action != "auto-advanced" || c.Status().CurrentStep != 1 {
+		t.Fatalf("mixed window: action=%s step=%d", d.Action, c.Status().CurrentStep)
+	}
+
+	// 旧格式重复 Seq：仍按全局乱序丢弃，不计数。
+	d, err = c.Reconcile(legacySnap(2, 0.99, 0.99))
+	logDecision(t, c, d, err, "legacy stale seq")
+	if !errors.Is(err, ErrStaleSnapshot) || c.Status().Observations != 0 {
+		t.Fatalf("legacy stale: err=%v obs=%d", err, c.Status().Observations)
+	}
+
+	// 新格式但属于已走过阶段 0（即使数据很坏）：丢弃，不回滚、不倒退。
+	d, err = c.Reconcile(&HealthSnapshot{Seq: 3, Step: intp(0), StepSeq: uintp(99), SuccessRatio: 0.01, HealthyRatio: 0.01})
+	logDecision(t, c, d, err, "new wrong step bad")
+	if !errors.Is(err, ErrWrongStep) {
+		t.Fatalf("wrong step: err=%v", err)
+	}
+	if s := c.Status(); s.CurrentStep != 1 || s.BreachStreak != 0 || s.RolledBack {
+		t.Fatalf("wrong-step mutated state: step=%d streak=%d rolledBack=%v",
+			s.CurrentStep, s.BreachStreak, s.RolledBack)
+	}
+
+	// 新格式阶段 1：阶段内序号严格递增依旧生效，重复/倒退被丢弃。
+	d, err = c.Reconcile(qualifiedSnap(4, 1, 10))
+	logDecision(t, c, d, err, "new step1 seq=10")
+	if err != nil || c.Status().Observations != 1 {
+		t.Fatalf("step1 seq=10: obs=%d err=%v", c.Status().Observations, err)
+	}
+	d, err = c.Reconcile(qualifiedSnap(5, 1, 10))
+	logDecision(t, c, d, err, "new step1 stale seq=10")
+	if !errors.Is(err, ErrStaleStepSeq) || c.Status().Observations != 1 {
+		t.Fatalf("step1 stale: err=%v obs=%d", err, c.Status().Observations)
+	}
+
+	// 旧格式数据在阶段 1 继续被正常计入（兼容语义不回退），攒满后放量。
+	d, err = c.Reconcile(legacySnap(6, 0.99, 0.99))
+	logDecision(t, c, d, err, "legacy step1 fill")
+	if d.Action != "auto-advanced" || c.Status().CurrentStep != 2 {
+		t.Fatalf("legacy step1 fill: action=%s step=%d", d.Action, c.Status().CurrentStep)
 	}
 }
